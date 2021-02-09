@@ -1,155 +1,173 @@
-import sys
 import random
+import threading
+import os
+import shutil
+import sys
+import time
 
-from dnn_policy import DnnPolicy
-from stable_baselines import A2C
 from super_tux_env import SuperTuxEnv
-from stable_baselines.common.vec_env import VecNormalize
-from stable_baselines.common.vec_env import DummyVecEnv
-from stable_baselines.common.callbacks import EvalCallback
-from tensorflow import compat
-
-
-def make_env(proc_name, port, render):
-    def _init():
-        env = SuperTuxEnv(proc_name, port, render)
-        return env
-    return _init
-
-
-def random_port_numbers(port_numbers, num_envs):
-    i = len(port_numbers)
-    while i < num_envs:
-        port_numbers.append(random.randint(49152, 65535))
-        i += 1
+from game_model import GameModel
+from deap import base, creator, tools
 
 
 def parse_arguments(argv):
-    if len(sys.argv) < 2:
-        print("You have to specify target game executable name")
-        exit(1)
-
-    proc_name = sys.argv[1]
-    num_envs = 1
-    port_numbers = list()
-    load_model = False
-    model_path = None
-    train_model = True
-    tensorboard_logs_path = None
-    render = True
-    steps = 1000000
-    eval_freq = 50000
+    models = 2
+    num_generations = 1
+    crossover_prob = 0.5
+    mutation_prob = 0.1
 
     for i in range(len(argv)):
-        if argv[i] == "--envs":
+        if argv[i] == "--models":
             i += 1
             if i > len(argv):
-                print("Need to specify number of environments for --envs")
+                print("Need to specify number of models for --models")
             else:
-                num_envs = int(argv[i])
-        
-        if argv[i] == "--load":
+                models = int(argv[i])
+                
+    for i in range(len(argv)):
+        if argv[i] == "--gens":
             i += 1
             if i > len(argv):
-                print("Need to specify saved model path for --load")
+                print("Need to specify number of generations for --gens")
             else:
-                load_model = True
-                model_path = str(argv[i])
-            
-        if argv[i] == "--no-train":
-            train_model = False
-
-        if argv[i] == "--tensorboard_log":
+                num_generations = int(argv[i])
+                
+    for i in range(len(argv)):
+        if argv[i] == "--cx-prob":
             i += 1
             if i > len(argv):
-                print("Need to specify directory to save Tensorboard logs for --tensorboard_log")
+                print("Need to specify probability of crossover for --cx-prob")
             else:
-                tensorboard_logs_path = str(argv[i])
-
-        if argv[i] == "--no-render":
-            render = False
-
-        if argv[i] == "--steps":
+                crossover_prob = int(argv[i])
+                
+    for i in range(len(argv)):
+        if argv[i] == "--mut-prob":
             i += 1
             if i > len(argv):
-                print("Need to specify steps number for --steps")
+                print("Need to specify probability of mutation for --mut-prob")
             else:
-                steps = int(argv[i])
-
-        if argv[i] == "--eval-freq":
-            i += 1
-            if i > len(argv):
-                print("Need to specify evaluation frequency for --eval_freq")
-            else:
-                eval_freq = int(argv[i])
-    
-    return proc_name, num_envs, port_numbers, load_model, model_path, train_model, tensorboard_logs_path, render,\
-           steps, eval_freq
+                mutation_prob = int(argv[i])
+                
+    return models, num_generations, crossover_prob, mutation_prob
 
 
 def main():
-    # Suppress Tensorflow warnings
-    compat.v1.logging.set_verbosity(compat.v1.logging.ERROR)
+    models, num_generations, crossover_prob, mutation_prob = parse_arguments(sys.argv)
+    
+    proc_name, num_envs, port_numbers, load_model, load_path, train_model, \
+    tensorboard_logs_path, render, steps, eval_freq = GameModel.parse_arguments(sys.argv)
 
-    # Parse arguments
-    proc_name, num_envs, port_numbers, load_model, model_path, train_model, tensorboard_logs_path, render, steps, eval_freq \
-        = parse_arguments(sys.argv)
-
-    assert num_envs is not 0, "--envs: Number of environments cannot be 0"
-
-    # Generate random port numbers for environments to use
-    while len(port_numbers) != num_envs + 1:
-        random_port_numbers(port_numbers, num_envs + 1)
-        port_numbers = list(set(port_numbers))
-
-    # Prepare environment and model
-    env = VecNormalize(DummyVecEnv([make_env(proc_name=proc_name, port=port_numbers[i], render=render) for i in range(num_envs)]),
-                       norm_reward=False)
-
-    model = None
-
-    if not load_model:
-        model = A2C(DnnPolicy, env, tensorboard_log=tensorboard_logs_path,
-                    lr_schedule="linear", ent_coef=0.0)
+    if not train_model:
+        model = GameModel(SuperTuxEnv)
+        model.test()
     else:
-        model = A2C.load(model_path, env, tensorboard_log=tensorboard_logs_path,
-                    lr_schedule="linear", ent_coef=0.0)
+        # Create directory for temporary files
+        try:
+            os.mkdir("tmp")
+        except FileExistsError:
+            pass
 
-    # Assert that model has been either created or loaded
-    assert model is not None
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("Individual", GameModel, fitness=creator.FitnessMax)
 
-    # Train model
-    if train_model:
+        toolbox = base.Toolbox()
 
-        # Print training settings
+        toolbox.register("mate", tools.cxTwoPoint)
+        toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.1)
+        toolbox.register("select", tools.selTournament, tournsize=3)
+
+        def make_individual():
+            return creator.Individual(SuperTuxEnv)
+
+        def clean_population(population):
+            for ind in population:
+                ind.close()
+
+        toolbox.register("population", tools.initRepeat, list, make_individual)
+
         print("-----------------------------------------")
-        print(f"Model training for {proc_name}")
+        print("Deep Reinforcement Learning Settings")
+        print("-----------------------------------------")
+        print(f"Models training for {proc_name}")
         print(f"Total timesteps: {steps}")
         print(f"Evaluation Frequency: {eval_freq}")
         print(f"Environments: {num_envs}")
         print(f"Rendering: {'On' if render else 'Off'}")
-        print("-----------------------------------------")
+        print("-----------------------------------------", end="\n\n")
 
-        eval_env = VecNormalize(DummyVecEnv([make_env(proc_name=proc_name, port=port_numbers[num_envs], render=render)]),
-                                norm_reward=False) if eval_freq > 0 else None
-        eval_callback = EvalCallback(eval_env, best_model_save_path='./models/',
-                                     log_path='./logs/', eval_freq=eval_freq,
-                                     deterministic=True, render=False) if eval_freq > 0 else None
-        model.learn(total_timesteps=steps, callback=eval_callback)
+        # Initialize population
+        print("Initializing models population...", end="\r")
+        pop = toolbox.population(n=models)
+        print("Initializing models population - Done", end="\n\n")
 
-    # Test model
-    # Print testing settings
-    print("-----------------------------------------")
-    print(f"Model testing for {proc_name}")
-    print(f"Environments: {num_envs}")
-    print(f"Rendering: {'On' if render else 'Off'}")
-    print("-----------------------------------------")
+        threads = list()
 
-    obs = env.reset()
+        for generation in range(num_generations):
+            print(f"########## Generation {generation} ##########")
 
-    while True:
-        action, _states = model.predict(obs)
-        obs, rewards, done, info = env.step(action)
+            # Train models
+            print("Training models...", end="\r")
+            for individual in pop:
+                thread = threading.Thread(target=GameModel.train, args=(individual,))
+                thread.start()
+                threads.append(thread)
+                time.sleep(5)
+
+            for thread in threads:
+                thread.join()
+
+            threads.clear()
+            print("Training models - Done")
+
+            # Evaluate population
+            print(f"Evaluating models... (0/{len(pop)})", end="\r")
+            fitnesses = map(GameModel.evaluate, pop)
+            evaluated_models = 0
+            for individual, fitness in zip(pop, fitnesses):
+                individual.fitness.values = fitness
+                evaluated_models += 1
+                print(f"Evaluating models... ({evaluated_models}/{len(pop)})", end="\r")
+            print("Evaluating models - Done     ")
+
+            # Select individuals to offspring
+            print("Selecting models to offspring...", end="\r")
+            offspring = toolbox.select(pop, len(pop))
+            offspring_params_floats = list()
+            for child in offspring:
+                child_data, child_params = child.get_params()
+                offspring_params_floats.append(GameModel.convert_params_to_floats(child_params))
+
+            print("Selecting models to offspring - Done")
+
+            # Mate even indices children with uneven indices children
+            print("Crossing-over models in offspring...", end="\r")
+            for child1, child2 in zip(offspring_params_floats[::2], offspring_params_floats[1::2]):
+                if random.random() < crossover_prob:
+                    toolbox.mate(child1, child2)
+            print("Crossing-over models in offspring - Done")
+
+            # Mutate
+            print("Mutating selected models in offspring...", end="\r")
+            for mutant in offspring_params_floats:
+                if random.random() < mutation_prob:
+                    toolbox.mutate(mutant)
+            print("Mutating selected models in offspring - Done")
+
+            # Replace population with offspring
+            print("Replacing models population with offspring...", end="\r")
+            for i in range(len(pop)):
+                data, params = pop[i].get_params()
+                pop[i].set_params(data, GameModel.convert_floats_to_params(offspring_params_floats[i], params))
+                del pop[i].fitness.values
+            print("Replacing models population with offspring - Done")
+
+            print(f"########## Generation finished ##########", end="\n\n")
+
+        # Close models and clean up their resources
+        print(f"Closing models and cleaning resources...", end="\r")
+        clean_population(pop)
+        shutil.rmtree("tmp", ignore_errors=True)
+        print(f"Closing models and cleaning resources - Done")
 
 
 main()
